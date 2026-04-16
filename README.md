@@ -600,7 +600,7 @@ Planning Time: 0.259 ms
 Execution Time: 31.440 ms
 ```
 
-하위 노드를 찾기 위해 임시 테이블을 생성하고, 조인 루프(`loops=3906`)가 반복적으로 발생했습니다. (소요 시간: **31.440 ms**)
+하위 폴더를 찾기 위해 임시 테이블을 생성하고, 조인 루프(`loops=3906`)가 반복적으로 발생했습니다. (소요 시간: **31.440 ms**)
 
 <br>
 
@@ -609,17 +609,17 @@ Execution Time: 31.440 ms
 EXPLAIN ANALYZE
 SELECT id, parent_folder_id, name, logical_path
 FROM drive_folder_tb 
-WHERE logical_path LIKE '/bef81acd-b8c5-4352-8280-37cdf5536098/7abc839b-4b1c-45eb-9e98-fc9b9075b805/59ff3411-809a-4048-9f7e-2a017dde5b0e/%'
+WHERE logical_path LIKE '/bef81acd-b8c5-2352-8280-37cdf5536098/7abc839b-4b1c-45eb-9e98-fc9b9075b805/59ff3411-809a-4048-9f7e-2a017dde5b0e/%'
   AND is_deleted = false;
 ```
 
 ```sql
 Bitmap Heap Scan on drive_folder_tb  (cost=1048.21..6872.69 rows=3946 width=385) (actual time=0.875..2.650 rows=3906 loops=1)
   Recheck Cond: (NOT is_deleted)
-  Filter: ((logical_path)::text ~~ '/bef81acd-b8c5-4352-8280-37cdf5536098/7abc839b-4b1c-45eb-9e98-fc9b9075b805/59ff3411-809a-4048-9f7e-2a017dde5b0e/%'::text)
+  Filter: ((logical_path)::text ~~ '/bef81acd-b8c5-2352-8280-37cdf5536098/7abc839b-4b1c-45eb-9e98-fc9b9075b805/59ff3411-809a-4048-9f7e-2a017dde5b0e/%'::text)
   Heap Blocks: exact=261
   ->  Bitmap Index Scan on idx_active_logical_path  (cost=0.00..1047.22 rows=3868 width=0) (actual time=0.843..0.843 rows=3906 loops=1)
-        Index Cond: (((logical_path)::text ~>=~ '/bef81acd-b8c5-4352-8280-37cdf5536098/7abc839b-4b1c-45eb-9e98-fc9b9075b805/59ff3411-809a-4048-9f7e-2a017dde5b0e/'::text) AND ((logical_path)::text ~<~ '/bef81acd-b8c5-4352-8280-37cdf5536098/7abc839b-4b1c-45eb-9e98-fc9b9075b805/59ff3411-809a-4048-9f7e-2a017dde5b0e0'::text))
+        Index Cond: (((logical_path)::text ~>=~ '/bef81acd-b8c5-2352-8280-37cdf5536098/7abc839b-4b1c-45eb-9e98-fc9b9075b805/59ff3411-809a-4048-9f7e-2a017dde5b0e/'::text) AND ((logical_path)::text ~<~ '/bef81acd-b8c5-2352-8280-37cdf5536098/7abc839b-4b1c-45eb-9e98-fc9b9075b805/59ff3411-809a-4048-9f7e-2a017dde5b0e0'::text))
 Planning Time: 0.182 ms
 Execution Time: 2.755 ms
 ```
@@ -647,58 +647,109 @@ xychart-beta
 
 <br>
 
-### 5-2. 대규모 계층 구조의 Soft Delete 성능 최적화: 쿼리 발생 횟수 상수 횟수로 최적화
+### 5-2. 폴더 임베딩 상태 동기화 성능 최적화: 쿼리 39회 → 4-5회
 
-#### 5-2-1. 문제 상황
-드라이브 서비스에서 상위 폴더를 삭제하면 해당 폴더를 포함하여 하위의 모든 자식 폴더와 파일들의 상태를 `is_deleted = true`로 변경하는 **Soft Delete** 작업이 필요합니다. 기존 로직은 JPA 변경감지에 의존하여 성능 병목을 유발했습니다.
+#### 5-2-1. 문제 상황: 상향식 전파의 구조적 한계
+파일 임베딩 완료 시, 해당 파일이 속한 폴더부터 최상위 루트까지 모든 조상 폴더들의 **임베딩 완료 여부**를 실시간으로 갱신해야 합니다.
+
+* **기존 방식 (재귀적 동기화):**
+```java
+List<String> folderIds = new ArrayList<>();
+String[] pathParts = logicalPath.split("/");
+
+// 파싱 및 역순 정렬 (자식 -> 부모 -> 조상)
+for (int i = pathParts.length - 1; i >= 0; i--) {
+    if (!pathParts[i].isEmpty()) {
+        folderIds.add(pathParts[i]);
+    }
+}
+
+// 상태 업데이트
+for (String folderId : folderIds) {
+    boolean hasIncompleteFile = driveFileQueryRepository.existsNotCompletedFileInFolder(folderId);
+
+    boolean hasIncompleteSubFolder = driveFolderQueryRepository.existsNotCompletedSubFolder(folderId);
+
+    boolean isComplete = !hasIncompleteFile && !hasIncompleteSubFolder;
+
+    driveFolderQueryRepository.updateAllEmbeddedStatus(folderId, isComplete);
+}
+```
+  * 자식 폴더에서 부모 폴더 ID를 참조하여 한 단계씩 거슬러 올라가는 방식.
+  * 조상 폴더 하나를 검증할 때마다 `[미완료 파일 체크(SELECT) → 미완료 자식 폴더 체크(SELECT) → 상태 갱신(UPDATE)]`의 3단계 과정이 반복됩니다.
+  * 결과: 트리의 깊이가 $D$일 때, $O(D \times 3)$ 회의 쿼리가 발생합니다. 테스트 환경(Depth 12)에서는 단 한 번의 상태 변화를 위해 약 39회의 DB I/O가 발생하여 가용성이 저하되었습니다.
+
+#### 5-2-2. 해결 방안: 메모리 연산 & Bulk Update
+매 단계 DB를 조회하는 대신, 임베딩 상태값 변화 영향권에 있는 모든 조상 폴더를 메모리에 로드하여 연산한 뒤 결과를 일괄 반영하도록 구조를 변경했습니다.
 
 ```java
-// 하위 자원을 찾기 위해 엔티티 그래프를 탐색하며 N번의 재귀 호출 발생
-private void deleteFolderRecursively(DriveFolderEntity folder) {
-    folder.delete();
-    for (DriveFileEntity file : folder.getFiles()) file.delete(); 
-    for (DriveFolderEntity sub : folder.getChildFolders()) deleteFolderRecursively(sub);
+List<DriveFolderEntity> folders = driveFolderQueryRepository.findByIds(new ArrayList<>(folderIds));
+Set<String> allTargetFolderIds = folders.stream()
+        .flatMap(f -> f.getAncestorFolderIds().stream())
+        .collect(Collectors.toSet());
+
+if (allTargetFolderIds.isEmpty()) return;
+
+// 미완료 파일을 가진 폴더 아이디들 (변하지 않는 상태)
+Set<String> folderIdsWithIncompleteFiles = driveFileQueryRepository.findFolderIdsWithIncompleteFiles(allTargetFolderIds);
+
+// 각 폴더별 임베딩 미완료 자식 폴더의 개수 (자식 폴더 상태가 바뀌면 바뀔 수 있음)
+Map<String, Long> incompleteChildCounts = driveFolderQueryRepository.findIncompleteSubFolderCounts(allTargetFolderIds);
+
+// 논리 경로에 있던 폴더 조회 및 정렬 (자식 -> 부모 순)
+List<DriveFolderEntity> sortedFolders = driveFolderQueryRepository.findByIds(new ArrayList<>(allTargetFolderIds));
+sortedFolders.sort((f1, f2) -> Integer.compare(f2.getDepth(), f1.getDepth()));
+
+// 폴더 임베딩 상태 bulk 연산 시킬 폴더 ID 목록
+List<String> folderIdsToMarkComplete = new ArrayList<>();
+List<String> folderIdsToMarkIncomplete = new ArrayList<>();
+
+// 자식 -> 부모 -> 조상 순서대로 폴더 임베딩 완료 상태 업데이트 및 업데이트할 폴더 아이디 수집
+evaluateStatusAndCollectUpdates(sortedFolders, folderIdsWithIncompleteFiles, incompleteChildCounts, folderIdsToMarkComplete, folderIdsToMarkIncomplete);
+
+// bulk로 일괄 업데이트
+if (!folderIdsToMarkComplete.isEmpty()) {
+    driveFolderRepository.bulkUpdateAllEmbeddedStatus(folderIdsToMarkComplete, true);
+}
+if (!folderIdsToMarkIncomplete.isEmpty()) {
+    driveFolderRepository.bulkUpdateAllEmbeddedStatus(folderIdsToMarkIncomplete, false);
 }
 ```
 
-* **$O(N)$ 쿼리 발생:** 하위 자원에 비례하여 선형적으로 쿼리가 증가합니다. 하위 폴더가 약 2만 개일 경우, 약 2만 번에 달하는 쿼리가 발생합니다.
-* **DB 커넥션 점유:** 단일 요청이 DB 트랜잭션을 오랫동안 점유하면서, 동시 접속자가 늘어나면 커넥션 풀 고갈 위험이 있습니다.
-* **메모리 및 연산 오버헤드:** 삭제할 폴더의 하위 폴더들을 모두 영속성 컨텍스트(메모리)에 올려 객체의 상태를 하나씩 변경합니다.
-
-#### 5-2-2. 해결 방안
-JPA의 변경감지 대신, **QueryDSL을 활용한 Bulk Update**로 수정했습니다.
-
-```sql
--- 애플리케이션 메모리에 올리지 않고, 경로 열거 패턴을 활용하여 DB 레벨에서 일괄 처리
-UPDATE drive_folder_tb SET is_deleted = true WHERE logical_path LIKE '/root-id/%';
-UPDATE drive_file_tb f SET is_deleted = true FROM drive_folder_tb d 
-WHERE f.folder_id = d.id AND d.logical_path LIKE '/root-id/%';
-```
-
-* **Path-based 필터링:** 각 자원이 가진 `logical_path` 컬럼을 활용했습니다. 삭제 대상 폴더의 경로가 `/A/B/`라면, 하위 모든 자식은 `/A/B/%` 형태의 경로를 가집니다.
-* **단일 SQL 처리:** JPA 엔티티를 하나씩 메모리에 올리는 대신, QueryDSL의 Bulk Update를 사용하여 DB 엔진 단에서 단 한 번의 쿼리로 모든 하위 자원을 처리하도록 변경했습니다.
+   * **조상 폴더 일괄 로딩:** `logical_path`를 파싱하여 루트까지의 조상 ID 리스트를 추출하고, 1회의 `IN` 절 쿼리로 상태 판단에 필요한 조상 엔티티와 미완료 카운트를 로드합니다.
+   * **메모리 기반 상향식 전파:** 로드된 폴더들을 Depth 역순(`자식 → 부모`)으로 정렬하여 메모리 내에서 상태를 평가합니다. 자식 폴더의 상태가 결정되면 부모 폴더의 미완료 카운트를 갱신하여 DB 조회 없이 연쇄적인 상태 판별을 수행합니다.
+   * **최종 상태 Bulk Update:** 연산 결과, 실제로 상태 변경(`True` 또는 `False`)이 필요한 폴더 ID만 필터링하여 최대 2회의 Bulk Update 쿼리로 모든 조상의 상태를 한 번에 갱신합니다.
 
 
 #### 5-2-3. 검증 결과
-데이터 규모를 4단계로 나누어 테스트하였습니다.
+
+```mermaid
+xychart-beta
+    title "상태 동기화 시 DB 쿼리 발생 횟수"
+    x-axis ["기존 (재귀적 조회)", "개선 (In-Memory 연산 후 일괄 갱신)"]
+    y-axis "쿼리 횟수" 0 --> 45
+    bar [39, 4]
+```
+
+* **테스트 환경:** 총 폴더 `8,191`개, 파일 `16,380`개, 최대 깊이 12의 트리 구조
+* **테스트 시나리오:** 최하단(`Depth 12`) 파일의 상태 변경이 루트(`Depth 0`)까지 12단계에 걸쳐 전파될 때의 부하 측정
 * **측정 도구:** JUnit 5, Spring StopWatch, Hibernate Statistics
 
-| 삭제 대상 하위 폴더 규모 | 기존 방식 (JPA 재귀) 처리 시간 | 개선 방식 (Bulk) 처리 시간 | 기존 방식 발생 쿼리 | 개선 방식 발생 쿼리 |
-| :--- | :--- | :--- | :--- | :--- |
-| **156개** | 0.41 초 | **0.11 초** | 167 회 | **5 회** |
-| **781개** | 0.86 초 | **0.17 초** | 806 회 | **5 회** |
-| **3,906개** | 2.24 초 | **0.19 초** | 3,995 회 | **5 회** |
-| **19,531개**| 7.88 초 | **0.70 초** | 19,934 회 | **5 회** |
+| 성능 지표 | 기존 방식 (Recursive Sync) | 개선 방식 (In-Memory Sync) | 개선 성과 |
+| :--- | :--- | :--- | :--- |
+| **쿼리 발생 횟수** | 39회 | **4-5회** | **87.1% 절감** |
+| **처리 시간 (로컬 환경)** | 0.212 sec | **0.101 sec** | **52.3% 단축** |
 
 <br>
 
 **[최적화 성과 요약]**
-- **DB 통신 비용(Network RTT) 최적화:** 데이터가 2만 건으로 증가해도 발생하는 DB 쿼리를 상수 횟수인 5회로 고정시켜, 애플리케이션과 DB 간의 통신 횟수를 99.97% 감소 시켰습니다.
-- **DB 커넥션 점유 시간 최적화:** 수만 번의 조회 쿼리로 인해 7.8초 가량 묶여있던 DB 커넥션 점유 시간을 0.7초로 91.1% 단축시켰습니다.
-- **메모리(영속성 컨텍스트) 최적화:** 2만 개의 대상 엔티티를 메모리에 로드하는 비용을 제거하여 대규모 상태 갱신 작업 시의 OOM 위험을 예방했습니다.
+- **DB 쿼리 발생 횟수 감소:** 폴더 깊이에 비례하여 발생하던 재귀적 조회/갱신 방식을 조상 폴더 일괄 조회(`IN 절`)로 변경하여, `깊이 12`에 위치한 폴더 임베딩 상태 동기화 시 발생하는 쿼리 횟수를 `39회`에서 `4-5회`로 감소 시켰습니다.
+
+- **동기화 처리 시간 단축:** 조상 폴더의 상태 판별을 DB I/O 대신 애플리케이션 메모리 내 연산으로 전환하고 결과를 Bulk Update로 일괄 반영하여, 단일 동기화 처리 시간을 물리적 네트워크 지연이 없는 로컬 환경 기준으로 0.212초에서 0.101초로 단축했습니다.
+
+- **트랜잭션 점유 시간 완화:** 해당 로직은 `1초` 주기의 `벡터 임베딩 스케줄러` 및 드라이브 내 쓰기 작업(`업로드`, `이동`, `삭제` 등)에서 트리거되는 동기화 로직입니다. 해당 동기화 로직의 최적화를 통해 시스템 전반의 DB 트랜잭션 점유 및 커넥션 부하를 줄였습니다.
 
 ---
-
 
 ### 5-3. 대규모 계층 구조 이동 성능 최적화: 쿼리 발생 횟수 상수 횟수로 최적화
 
@@ -754,98 +805,55 @@ WHERE logical_path LIKE '/old-path/%';
 
 <br>
 
-### 5-4. 폴더 임베딩 상태 동기화 성능 최적화: 쿼리 39회 → 4-5회
+### 5-2. 대규모 계층 구조의 Soft Delete 성능 최적화: 쿼리 발생 횟수 상수 횟수로 최적화
 
-#### 5-4-1. 문제 상황: 상향식 전파의 구조적 한계
-파일 임베딩 완료 시, 해당 파일이 속한 폴더부터 최상위 루트까지 모든 조상 폴더들의 **임베딩 완료 여부**를 실시간으로 갱신해야 합니다.
-
-* **기존 방식 (재귀적 동기화):**
-```java
-List<String> folderIds = new ArrayList<>();
-String[] pathParts = logicalPath.split("/");
-
-// 파싱 및 역순 정렬 (자식 -> 부모 -> 조상)
-for (int i = pathParts.length - 1; i >= 0; i--) {
-    if (!pathParts[i].isEmpty()) {
-        folderIds.add(pathParts[i]);
-    }
-}
-
-// 상태 업데이트
-for (String folderId : folderIds) {
-    boolean hasIncompleteFile = driveFileQueryRepository.existsNotCompletedFileInFolder(folderId);
-
-    boolean hasIncompleteSubFolder = driveFolderQueryRepository.existsNotCompletedSubFolder(folderId);
-
-    boolean isComplete = !hasIncompleteFile && !hasIncompleteSubFolder;
-
-    driveFolderQueryRepository.updateAllEmbeddedStatus(folderId, isComplete);
-}
-```
-  * 자식 폴더에서 부모 폴더 ID를 참조하여 한 단계씩 거슬러 올라가는 방식.
-  * 조상 노드 하나를 검증할 때마다 `[미완료 파일 체크(SELECT) → 미완료 자식 폴더 체크(SELECT) → 상태 갱신(UPDATE)]`의 3단계 과정이 반복됩니다.
-  * 결과: 트리의 깊이가 $D$일 때, $O(D \times 3)$ 회의 쿼리가 발생합니다. 테스트 환경(Depth 12)에서는 단 한 번의 상태 변화를 위해 약 39회의 DB I/O가 발생하여 가용성이 저하되었습니다.
-
-#### 5-4-2. 해결 방안: 메모리 연산 & Bulk Update
-매 단계 DB를 조회하는 대신, 임베딩 상태값 변화 영향권에 있는 모든 조상 폴더를 메모리에 로드하여 연산한 뒤 결과를 일괄 반영하도록 구조를 변경했습니다.
+#### 5-2-1. 문제 상황
+드라이브 서비스에서 상위 폴더를 삭제하면 해당 폴더를 포함하여 하위의 모든 자식 폴더와 파일들의 상태를 `is_deleted = true`로 변경하는 **Soft Delete** 작업이 필요합니다. 기존 로직은 JPA 변경감지에 의존하여 성능 병목을 유발했습니다.
 
 ```java
-List<DriveFolderEntity> folders = driveFolderQueryRepository.findByIds(new ArrayList<>(folderIds));
-Set<String> allTargetFolderIds = folders.stream()
-        .flatMap(f -> f.getAncestorFolderIds().stream())
-        .collect(Collectors.toSet());
-
-if (allTargetFolderIds.isEmpty()) return;
-
-// 미완료 파일을 가진 폴더 아이디들 (변하지 않는 상태)
-Set<String> folderIdsWithIncompleteFiles = driveFileQueryRepository.findFolderIdsWithIncompleteFiles(allTargetFolderIds);
-
-// 각 폴더별 임베딩 미완료 자식 폴더의 개수 (자식 폴더 상태가 바뀌면 바뀔 수 있음)
-Map<String, Long> incompleteChildCounts = driveFolderQueryRepository.findIncompleteSubFolderCounts(allTargetFolderIds);
-
-// 논리 경로에 있던 폴더 조회 및 정렬 (자식 -> 부모 순)
-List<DriveFolderEntity> sortedFolders = driveFolderQueryRepository.findByIds(new ArrayList<>(allTargetFolderIds));
-sortedFolders.sort((f1, f2) -> Integer.compare(f2.getDepth(), f1.getDepth()));
-
-// 폴더 임베딩 상태 bulk 연산 시킬 폴더 ID 목록
-List<String> folderIdsToMarkComplete = new ArrayList<>();
-List<String> folderIdsToMarkIncomplete = new ArrayList<>();
-
-// 자식 -> 부모 -> 조상 순서대로 폴더 임베딩 완료 상태 업데이트 및 업데이트할 폴더 아이디 수집
-evaluateStatusAndCollectUpdates(sortedFolders, folderIdsWithIncompleteFiles, incompleteChildCounts, folderIdsToMarkComplete, folderIdsToMarkIncomplete);
-
-// bulk로 일괄 업데이트
-if (!folderIdsToMarkComplete.isEmpty()) {
-    driveFolderRepository.bulkUpdateAllEmbeddedStatus(folderIdsToMarkComplete, true);
-}
-if (!folderIdsToMarkIncomplete.isEmpty()) {
-    driveFolderRepository.bulkUpdateAllEmbeddedStatus(folderIdsToMarkIncomplete, false);
+// 하위 자원을 찾기 위해 엔티티 그래프를 탐색하며 N번의 재귀 호출 발생
+private void deleteFolderRecursively(DriveFolderEntity folder) {
+    folder.delete();
+    for (DriveFileEntity file : folder.getFiles()) file.delete(); 
+    for (DriveFolderEntity sub : folder.getChildFolders()) deleteFolderRecursively(sub);
 }
 ```
 
-   * **조상 폴더 일괄 로딩:** `logical_path`를 파싱하여 루트까지의 조상 ID 리스트를 추출하고, 1회의 `IN` 절 쿼리로 상태 판단에 필요한 조상 엔티티와 미완료 카운트를 로드합니다.
-   * **메모리 기반 상향식 전파:** 로드된 폴더들을 Depth 역순(`자식 → 부모`)으로 정렬하여 메모리 내에서 상태를 평가합니다. 자식 폴더의 상태가 결정되면 부모 폴더의 미완료 카운트를 갱신하여 DB 조회 없이 연쇄적인 상태 판별을 수행합니다.
-   * **최종 상태 Bulk Update:** 연산 결과, 실제로 상태 변경(`True` 또는 `False`)이 필요한 폴더 ID만 필터링하여 최대 2회의 Bulk Update 쿼리로 모든 조상의 상태를 한 번에 갱신합니다.
+* **$O(N)$ 쿼리 발생:** 하위 자원에 비례하여 선형적으로 쿼리가 증가합니다. 하위 폴더가 약 2만 개일 경우, 약 2만 번에 달하는 쿼리가 발생합니다.
+* **DB 커넥션 점유:** 단일 요청이 DB 트랜잭션을 오랫동안 점유하면서, 동시 접속자가 늘어나면 커넥션 풀 고갈 위험이 있습니다.
+* **메모리 및 연산 오버헤드:** 삭제할 폴더의 하위 폴더들을 모두 영속성 컨텍스트(메모리)에 올려 객체의 상태를 하나씩 변경합니다.
 
+#### 5-2-2. 해결 방안
+JPA의 변경감지 대신, **QueryDSL을 활용한 Bulk Update**로 수정했습니다.
 
-#### 5-4-3. 검증 결과
-
-```mermaid
-xychart-beta
-    title "상태 동기화 시 DB 쿼리 발생 횟수"
-    x-axis ["기존 (재귀적 조회)", "개선 (In-Memory 연산 후 일괄 갱신)"]
-    y-axis "쿼리 횟수" 0 --> 45
-    bar [39, 4]
+```sql
+-- 애플리케이션 메모리에 올리지 않고, 경로 열거 패턴을 활용하여 DB 레벨에서 일괄 처리
+UPDATE drive_folder_tb SET is_deleted = true WHERE logical_path LIKE '/root-id/%';
+UPDATE drive_file_tb f SET is_deleted = true FROM drive_folder_tb d 
+WHERE f.folder_id = d.id AND d.logical_path LIKE '/root-id/%';
 ```
 
-* **테스트 환경:** 총 폴더 `8,191`개, 파일 `16,380`개, 최대 깊이 12의 트리 구조
-* **테스트 시나리오:** 최하단(`Depth 12`) 파일의 상태 변경이 루트(`Depth 0`)까지 12단계에 걸쳐 전파될 때의 부하 측정
+* **Path-based 필터링:** 각 자원이 가진 `logical_path` 컬럼을 활용했습니다. 삭제 대상 폴더의 경로가 `/A/B/`라면, 하위 모든 자식은 `/A/B/%` 형태의 경로를 가집니다.
+* **단일 SQL 처리:** JPA 엔티티를 하나씩 메모리에 올리는 대신, QueryDSL의 Bulk Update를 사용하여 DB 엔진 단에서 단 한 번의 쿼리로 모든 하위 자원을 처리하도록 변경했습니다.
+
+
+#### 5-2-3. 검증 결과
+데이터 규모를 4단계로 나누어 테스트하였습니다.R
 * **측정 도구:** JUnit 5, Spring StopWatch, Hibernate Statistics
 
-| 성능 지표 | 기존 방식 (Recursive Sync) | 개선 방식 (In-Memory Sync) | 개선 성과 |
-| :--- | :--- | :--- | :--- |
-| **쿼리 발생 횟수** | 39회 | **4-5회** | **87.1% 절감** |
-| **처리 시간 (로컬 환경)** | 0.212 sec | **0.101 sec** | **52.3% 단축** |
+| 삭제 대상 하위 폴더 규모 | 기존 방식 (JPA 재귀) 처리 시간 | 개선 방식 (Bulk) 처리 시간 | 기존 방식 발생 쿼리 | 개선 방식 발생 쿼리 |
+| :--- | :--- | :--- | :--- | :--- |
+| **156개** | 0.41 초 | **0.11 초** | 167 회 | **5 회** |
+| **781개** | 0.86 초 | **0.17 초** | 806 회 | **5 회** |
+| **3,906개** | 2.24 초 | **0.19 초** | 3,995 회 | **5 회** |
+| **19,531개**| 7.88 초 | **0.70 초** | 19,934 회 | **5 회** |
+
+<br>
+
+**[최적화 성과 요약]**
+- **DB 통신 비용(Network RTT) 최적화:** 데이터가 2만 건으로 증가해도 발생하는 DB 쿼리를 상수 횟수인 5회로 고정시켜, 애플리케이션과 DB 간의 통신 횟수를 99.97% 감소 시켰습니다.
+- **DB 커넥션 점유 시간 최적화:** 수만 번의 조회 쿼리로 인해 7.8초 가량 묶여있던 DB 커넥션 점유 시간을 0.7초로 91.1% 단축시켰습니다.
+- **메모리(영속성 컨텍스트) 최적화:** 2만 개의 대상 엔티티를 메모리에 로드하는 비용을 제거하여 대규모 상태 갱신 작업 시의 OOM 위험을 예방했습니다.
 
 <br>
 
