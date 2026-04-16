@@ -201,32 +201,30 @@ sequenceDiagram
     activate E
     
     %% Transaction 1
-    rect rgb(45, 45, 55)
-        Note right of E: DB 락 점유 및 타겟 선점
-        E->>SVC: findWithPLockAndMarkProcessing(version)
-        activate SVC
-        
-        SVC->>DB: findNextEmbeddingTargetWithPLock()<br/>(Pessimistic Lock + SKIP LOCKED)
-        Note right of DB: 1. PRIORITIZED<br/>2. FAILED<br/>3. READY...
-        DB-->>SVC: DriveFileEntity (우선순위 타겟)
+    Note right of E: DB 락 점유 및 타겟 선점
+    E->>SVC: findWithPLockAndMarkProcessing(version)
+    activate SVC
+    
+    SVC->>DB: findNextEmbeddingTargetWithPLock()<br/>(Pessimistic Lock + SKIP LOCKED)
+    Note right of DB: 1. PRIORITIZED<br/>2. FAILED<br/>3. READY...
+    DB-->>SVC: DriveFileEntity (우선순위 타겟)
 
-        alt 타겟 파일 없음
+    alt 타겟 파일 없음
+        SVC-->>E: null 반환 (작업 종료)
+    else 타겟 파일 존재
+        SVC->>FS: exists(driveCode, fileId)
+        FS-->>SVC: boolean
+        
+        alt 스토리지에 파일 없음
+            SVC->>DB: update(MISSING)
             SVC-->>E: null 반환 (작업 종료)
-        else 타겟 파일 존재
-            SVC->>FS: exists(driveCode, fileId)
-            FS-->>SVC: boolean
-            
-            alt 스토리지에 파일 없음
-                SVC->>DB: update(MISSING)
-                SVC-->>E: null 반환 (작업 종료)
-            else 스토리지에 파일 있음
-                SVC->>DB: update(PROCESSING)
-                SVC-->>E: EmbeddingTask
-            end
+        else 스토리지에 파일 있음
+            SVC->>DB: update(PROCESSING)
+            SVC-->>E: EmbeddingTask
         end
-        deactivate SVC
-        Note over DB: 트랜잭션 커밋 및 DB Lock 해제
     end
+    deactivate SVC
+    Note over DB: 트랜잭션 커밋 및 DB Lock 해제
 
     %% 3. 재처리 대상 폴더 상태 선제 업데이트
     opt originalStatus == COMPLETED
@@ -235,37 +233,33 @@ sequenceDiagram
     end
 
     %% 4. RAG API 연동 (네트워크 I/O)
-    rect rgb(35, 45, 60)
-        Note right of E: 외부 API 블로킹 대기
-        E->>SVC: processFileEmbedding(apiRequest)
-        activate SVC
-        SVC->>API: POST /rag/upload-files
-        API-->>SVC: RagApiResponse
-        SVC-->>E: RagApiResponse
-        deactivate SVC
-    end
+    Note right of E: 외부 API 블로킹 대기
+    E->>SVC: processFileEmbedding(apiRequest)
+    activate SVC
+    SVC->>API: POST /rag/upload-files
+    API-->>SVC: RagApiResponse
+    SVC-->>E: RagApiResponse
+    deactivate SVC
 
     %% 5. 결과 반영 및 폴더 동기화
-    rect rgb(35, 55, 45)
-        Note right of E: 결과 반영 및 폴더 동기화
-        E->>SVC: applyEmbeddingResultAndSyncFolder()
-        activate SVC
-        
-        alt 임베딩 성공
-            SVC->>DB: update(COMPLETED, tokenSize, version)
-        else 임베딩 실패
-            SVC->>DB: update(FAILED, version)
-        end
-
-        opt 파일 상태 == COMPLETED & 삭제 안 됨 & 폴더 존재
-            SVC->>SVC: updateFolderEmbStatusByFolderId()
-            Note over SVC, DB: 재귀적 조회를 피하기 위해 메모리 연산<br/>(자식 -> 부모 -> 조상 순)
-            SVC->>DB: 폴더 상태 Bulk Update (isAllEmbedded)
-        end
-        
-        SVC-->>E: 처리 완료
-        deactivate SVC
+    Note right of E: 결과 반영 및 폴더 동기화
+    E->>SVC: applyEmbeddingResultAndSyncFolder()
+    activate SVC
+    
+    alt 임베딩 성공
+        SVC->>DB: update(COMPLETED, tokenSize, version)
+    else 임베딩 실패
+        SVC->>DB: update(FAILED, version)
     end
+
+    opt 파일 상태 == COMPLETED & 삭제 안 됨 & 폴더 존재
+        SVC->>SVC: updateFolderEmbStatusByFolderId()
+        Note over SVC, DB: 재귀적 조회를 피하기 위해 메모리 연산<br/>(자식 -> 부모 -> 조상 순)
+        SVC->>DB: 폴더 상태 Bulk Update (isAllEmbedded)
+    end
+    
+    SVC-->>E: 처리 완료
+    deactivate SVC
 
     Note over S, E: finally: activeCount 감소 (슬롯 반환)
     deactivate E
