@@ -735,7 +735,7 @@ xychart-beta
 * **테스트 시나리오:** 최하단(`Depth 12`) 파일의 상태 변경이 루트(`Depth 0`)까지 12단계에 걸쳐 전파될 때의 부하 측정
 * **측정 도구:** JUnit 5, Spring StopWatch, Hibernate Statistics
 
-| 성능 지표 | 기존 방식 (Recursive Sync) | 개선 방식 (In-Memory Sync) | 개선 성과 |
+| 성능 지표 | 기존 방식 (Recursive DB I/O) | 개선 방식 (In-Memory 연산 후 Bulk Update) | 개선 성과 |
 | :--- | :--- | :--- | :--- |
 | **쿼리 발생 횟수** | 39회 | **4-5회** | **87.1% 절감** |
 | **처리 시간 (로컬 환경)** | 0.212 sec | **0.101 sec** | **52.3% 단축** |
