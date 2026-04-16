@@ -166,85 +166,120 @@ DriveEmbeddingScheduler (FOR UPDATE SKIP LOCKED 제어)
 <br>
 
 ## 2. 벡터 임베딩 파이프라인과 폴더 임베딩 상태 동기화
-파일이 업로드되면 AI가 읽을 수 있도록 벡터 임베딩하는 백그라운드 스케줄러와, 그 상태를 폴더에 동기화하는 로직입니다.
+파일이 업로드되면 AI가 읽을 수 있도록 벡터 임베딩하는 백그라운드 병렬 Worker와, 폴더 하위의 파일들의 임베딩 여부 상태에 따른 폴더 임베딩 상태를 동기화하는 로직입니다.
 
-### 2-1. 비관적 락 & Skip Locked 기반의 스케줄링
-큐를 사용하면 서버 다운 시 작업 내역이 증발합니다. 따라서 DB 테이블 자체를 안정적인 작업 대기열로 활용합니다.
+### 2-1. 비관적 락 & SELECT FOR UPDATE SKIP LOCKED 기반의 스케줄링
+메모리 큐를 사용하면 서버 다운 시 작업 내역이 증발합니다. 이를 방지하기 위해 DB 테이블 자체를 안정적인 작업 대기열로 활용하며, `SELECT FOR UPDATE SKIP LOCKED`를 통해 다중 스레드 환경에서의 `Race Condition` 없이 병렬 처리합니다.
 
 **[임베딩 스케줄러 동작 시퀀스 다이어그램]**
 ```mermaid
 sequenceDiagram
     autonumber
-    
-    actor Timer as Scheduler<br>(@Scheduled)
-    participant Svc as DriveEmbeddingService
-    participant DB as PostgreSQL<br>(DB & Lock)
-    participant API as RAG Server<br>(FastAPI)
 
-    Note over Timer: 1초마다 fixedDelay 폴링 실행
-    
-    %% 1. RAG 서버 헬스체크
-    Timer->>Svc: 1. getRagHealth()
-    Svc->>API: GET /rag/health
-    API-->>Svc: status, version 반환
-    Svc-->>Timer: RagHealthRes 반환
-    
-    alt RAG 서버 DOWN 상태
-        Note over Timer: 즉시 return (폴링 중단)
-    end
+    participant S as Scheduler<br/>(@Scheduled)
+    participant E as Executor<br/>(Worker Thread)
+    participant SVC as EmbeddingService
+    participant DB as Repository<br/>(File / Folder)
+    participant FS as FileStorage
+    participant API as RAG API Server
 
-    %% 2. 타겟 선점 (트랜잭션 1)
-    rect rgb(252, 228, 236)
-        Note right of Timer: [Transaction 1] DB 락 점유 및 상태 변경
-        Timer->>Svc: 2. findWithPLockAndMarkProcessing()
-        Svc->>DB: SELECT FOR UPDATE SKIP LOCKED
-        DB-->>Svc: 우선순위에 따른 타겟 파일 반환
-        Svc->>DB: UPDATE status = 'PROCESSING'
-        Note over DB: 트랜잭션 커밋 후 즉시 DB Lock 해제
-        Svc-->>Timer: EmbeddingTask 반환
-    end
+    %% 1. 스케줄링 및 헬스 체크
+    loop Every 1 Second
+        S->>SVC: getRagHealth()
+        SVC->>API: GET /rag/health
+        API-->>SVC: 상태(UP/DOWN) 및 버전
+        SVC-->>S: RagHealthRes
 
-    alt 타겟 파일 없음 (NULL)
-        Note over Timer: 즉시 return (대기)
-    end
-
-    %% 3. 폴더 상태 사전 업데이트 (필요 시)
-    opt 기존 상태가 COMPLETED였던 경우
-        Timer->>Svc: 3. applyFolderEmbeddingStatusByFileId()
-        Svc->>DB: 폴더 상태 Incomplete로 변경 (Tx)
-    end
-
-    %% 4. 외부 API 호출 (DB 락 없음)
-    rect rgb(227, 242, 253)
-        Note right of Timer: [Network I/O] DB 커넥션 없이 안전하게 외부 통신
-        Timer->>Svc: 4. processFileEmbedding(req)
-        Svc->>API: POST /rag/upload-files (파일 벡터화 요청)
-        API-->>Svc: RagApiResponse (성공/실패, 토큰 사이즈 등) 반환
-        Svc-->>Timer: 결과 반환
-    end
-
-    %% 5. 결과 반영 및 폴더 동기화 (트랜잭션 2)
-    rect rgb(232, 245, 233)
-        Note right of Timer: [Transaction 2] 결과 반영 및 동기화
-        Timer->>Svc: 5. applyEmbeddingResultAndSyncFolder()
-        
-        alt 성공 (isSuccess == true)
-            Svc->>DB: UPDATE status = 'COMPLETED', token_size
-            Svc->>Svc: 폴더 임베딩 동기화(Bottom-Up) 수행
-            Svc->>DB: Bulk Update 폴더 상태
-        else 실패 (isSuccess == false)
-            Svc->>DB: UPDATE status = 'FAILED'
+        opt Health != DOWN & Available Workers > 0
+            S->>E: submit(processEmbeddingTask)
+            Note over S, E: activeCount 증가 (슬롯 선점)
         end
     end
+
+    %% 2. 워커 스레드 작업 수행 (타겟 선점)
+    Note over E, API: --- 스레드 풀 워커의 개별 작업 흐름 ---
+    activate E
+    
+    %% Transaction 1
+    rect rgb(45, 45, 55)
+        Note right of E: DB 락 점유 및 타겟 선점
+        E->>SVC: findWithPLockAndMarkProcessing(version)
+        activate SVC
+        
+        SVC->>DB: findNextEmbeddingTargetWithPLock()<br/>(Pessimistic Lock + SKIP LOCKED)
+        Note right of DB: 1. PRIORITIZED<br/>2. FAILED<br/>3. READY...
+        DB-->>SVC: DriveFileEntity (우선순위 타겟)
+
+        alt 타겟 파일 없음
+            SVC-->>E: null 반환 (작업 종료)
+        else 타겟 파일 존재
+            SVC->>FS: exists(driveCode, fileId)
+            FS-->>SVC: boolean
+            
+            alt 스토리지에 파일 없음
+                SVC->>DB: update(MISSING)
+                SVC-->>E: null 반환 (작업 종료)
+            else 스토리지에 파일 있음
+                SVC->>DB: update(PROCESSING)
+                SVC-->>E: EmbeddingTask
+            end
+        end
+        deactivate SVC
+        Note over DB: 트랜잭션 커밋 및 DB Lock 해제
+    end
+
+    %% 3. 재처리 대상 폴더 상태 선제 업데이트
+    opt originalStatus == COMPLETED
+        E->>SVC: applyFolderEmbeddingStatusByFileId()
+        SVC->>DB: 폴더 임베딩 상태 연산 및 업데이트 (Tx)
+    end
+
+    %% 4. RAG API 연동 (네트워크 I/O)
+    rect rgb(35, 45, 60)
+        Note right of E: 외부 API 블로킹 대기
+        E->>SVC: processFileEmbedding(apiRequest)
+        activate SVC
+        SVC->>API: POST /rag/upload-files
+        API-->>SVC: RagApiResponse
+        SVC-->>E: RagApiResponse
+        deactivate SVC
+    end
+
+    %% 5. 결과 반영 및 폴더 동기화
+    rect rgb(35, 55, 45)
+        Note right of E: 결과 반영 및 폴더 동기화
+        E->>SVC: applyEmbeddingResultAndSyncFolder()
+        activate SVC
+        
+        alt 임베딩 성공
+            SVC->>DB: update(COMPLETED, tokenSize, version)
+        else 임베딩 실패
+            SVC->>DB: update(FAILED, version)
+        end
+
+        opt 파일 상태 == COMPLETED & 삭제 안 됨 & 폴더 존재
+            SVC->>SVC: updateFolderEmbStatusByFolderId()
+            Note over SVC, DB: 재귀적 조회를 피하기 위해 메모리 연산<br/>(자식 -> 부모 -> 조상 순)
+            SVC->>DB: 폴더 상태 Bulk Update (isAllEmbedded)
+        end
+        
+        SVC-->>E: 처리 완료
+        deactivate SVC
+    end
+
+    Note over S, E: finally: activeCount 감소 (슬롯 반환)
+    deactivate E
 ```
 
-- **Race Condition 방지:** 다중 인스턴스 환경에서 동일한 파일을 중복 임베딩하는 것을 막기 위해 `DriveEmbeddingScheduler`에 DB 레벨의 `FOR UPDATE SKIP LOCKED` 구문을 적용하였습니다. 타 스레드는 충돌 발생 시 대기 없이 즉시 다음 타겟을 처리합니다.
+- **Worker Pool 기반 병렬 처리 및 부하 제어**
+  - 외부 AI 모델(RAG 서버)의 과부하를 막기 위해, `FixedThreadPool`과 `AtomicInteger`를 통해 동시에 실행되는 API 요청 수를 `maxWorkers` 개수로 제한합니다.
+  - 메인 클라이언트 요청을 처리하는 Tomcat 스레드와 임베딩 워커 스레드를 분리하여, 임베딩 지연이 일반 사용자의 API 호출 응답성에 영향을 주지 않도록 합니다.
 
-- **락 범위 최적화 및 원자적 선점** 
-  - 스케줄러는 `SELECT FOR UPDATE SKIP LOCKED`를 통해 작업 대상을 조회함과 동시에 해당 Row에 락을 겁니다.
-  - 이후 상태를 `PROCESSING`으로 변경하고 트랜잭션을 커밋하여 DB 락을 해제합니다.
-  - 이를 통해 DB 커넥션을 점유하는 시간을 최소화하며, 타 인스턴스가 동일한 작업에 접근하는 것을 차단(선점)합니다.
-  - 이후에 이루어지는 벡터 임베딩 API 요청은 DB 락이 해제된 상태에서 동기 작업으로 수행됩니다.
+- **SKIP LOCKED를 활용한 분산 동시성 제어 및 락 최적화** 
+  - 다중 서버 및 다중 스레드 환경에서 동일한 파일에 중복 접근하는 것을 막기 위해 `SELECT FOR UPDATE SKIP LOCKED` 구문을 사용합니다. 경합이 발생해도 스레드가 대기하지 않고 다른 타겟을 찾습니다.
+  - 타겟을 찾으면(선점하면) 상태를 `PROCESSING`으로 변경하고 트랜잭션을 커밋하여 DB 락을 해제합니다.
+  - 이를 통해 DB 커넥션을 점유하는 시간을 최소화하며, 타 워커 스레드가 동일한 타겟에 접근하는 것을 막습니다.
+  - 이후에 이루어지는 벡터 임베딩 API 요청은 DB 락과 트랜잭션이 해제된 상태에서 동기 작업으로 수행됩니다.
 
 - **우선순위 기반 DB 폴링:** DB에서 6단계 우선순위에 따라 1건씩 타겟을 가져옵니다.
   1. **수동 요청 (PRIORITIZED):** 사용자가 명시적으로 최우선 처리를 요청한 파일
