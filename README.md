@@ -534,153 +534,316 @@ sequenceDiagram
 ---
 <br>
 
-## 5. 운영 및 유지보수
-### 5-1. 핵심 상태 값 및 데이터 딕셔너리
-DB를 직접 조회하거나 운영 이슈를 추적할 때 알아야 하는 주요 Enum 상태 값입니다.
+## 5. 드라이브 시스템 성능 최적화 검증
 
-**[DriveFileEmbeddingStatus - 임베딩 파이프라인 상태]**
-- `PRIORITIZED`: 사용자가 수동으로 우선 처리를 요청하여 임베딩 우선순위 최우선 상태
-- `READY`: 신규 업로드되어 임베딩 대기 중인 정상 상태
-- `PROCESSING`: 스케줄러가 현재 벡터 임베딩 요청을 보내고, RAG 쪽에서 진행 중인 상태 (30분 이상 이 상태라면 프로세스 다운으로 인한 좀비 태스크 의심)
-- `COMPLETED`: 성공적으로 임베딩이 완료된 상태
-- `FAILED`: 임베딩 중 에러가 발생한 상태 (60분 경과 시 스케줄러가 자동 재시도)
-- `MISSING`: DB에는 존재하나 물리 스토리지에 파일이 없어 작업이 불가능한 고아 파일 상태 (임베딩 대상에서 제외)
+### 5-1. 대용량 계층 구조 탐색 성능 향상 검증 (31.4ms → 2.7ms)
 
-**[DriveSourceType - 파일 출처]**
-- `DRIVE`: 일반적인 드라이브 시스템을 통해 업로드된 파일 (AI 질의 가능)
-- `CHAT_ROOM`: 채팅방에서 업로드되어 `Chat Uploads` 폴더에 위치한 파일 (AI 질의 불가)
-- `MANUAL_FILE`: 시스템 관리자 등에 의해 수동으로 관리되는 시스템 파일 (예: `서비스 이용 가이드` 등, AI 질의 불가)
+#### 5-1-1. 설계 배경 및 가설 
+- 드라이브 시스템의 핵심 도메인 특성은 **쓰기(Write)보다 읽기(Read)의 빈도가 압도적으로 높다**는 것입니다. 
 
-**[통합 권한 계층]**
-- `TargetType`: `PROJECT`, `PROMPT`, `DRIVE`, `DRIVE_FOLDER`, `DRIVE_FILE`, `CHAT_ROOM` (공유 및 권한의 대상이 되는 자원 식별자)
-- `SubjectType`: `USER`, `GROUP` (권한을 부여받는 주체 식별자)
-- `AccessRoleType`: `VIEWER`(읽기), `EDITOR`(쓰기/수정), `OWNER`(삭제/권한위임), `ADMIN`(시스템 제어)
+- 초기 DB 스키마 설계 시, 계층 구조를 표현하는 가장 일반적인 방식인 인접 목록 모델(Adjacency List, `parent_id` 참조)을 고려했습니다. 
+- 하지만 이 방식은 특정 폴더 하위의 모든 자원을 탐색할 때 재귀 쿼리(`Recursive CTE`)가 유발되며, 트리의 깊이(`Depth`)가 깊어질수록 반복적인 조인과 임시 테이블(`WorkTable`) 생성으로 인한 I/O 병목이 발생할 것으로 예상했습니다.
 
-<hr><br>
+- 이에 따라 쓰기 비용(경로 업데이트)을 감수하더라도, 조회 성능을 끌어올릴 수 있는 **경로 열거(Path Enumeration) 패턴**을 초기 아키텍처로 채택했습니다.
 
-### 5-2. 물리 파일 스토리지 (FileStorageService)
-`FileStorageService`는 애플리케이션과 물리 스토리지 간의 직접적인 `I/O`를 전담하는 서비스입니다. 비즈니스 계층에서 `파일 I/O`를 안전하고 일관성 있게 다루기 위해 다음과 같은 설계 원칙을 따릅니다.
+#### 5-1-2. 설계 구현 및 인덱스 
+- **Path-based 스키마 설계:** 모든 자원에 누적 논리 경로를 저장하는 `logical_path` (예: `/root-id/sub-id/`) 컬럼을 추가하여, 단일 `LIKE '/target-id/%'` 연산만으로 하위 자원을 모두 식별할 수 있도록 구성했습니다.
 
-**아키텍처적 의도: I/O 기술 의존성 격리**
-- 목적: 도메인 서비스가 java.io.File, java.nio.file.Path 등 저수준 인프라 API에 직접 의존하지 않도록 캡슐화했습니다.
+- **Pattern Matching 인덱스 (varchar_pattern_ops):** `PostgreSQL`에서 기본 `B-Tree` 인덱스는 데이터베이스의 정렬 규칙에 따라 `LIKE` 검색 시 인덱스를 타지 못하고 `Full Scan`을 할 수 있습니다. 이를 방지하기 위해 `logical_path` 컬럼에 문자 단위(`Byte-by-byte`) 비교를 강제하는 `varchar_pattern_ops` 오퍼레이터 클래스를 적용하여 `Index Range Scan`을 유도했습니다.
 
-- 활용: 비즈니스 레이어는 파일의 물리적 위치(절대 경로)를 알 필요 없이, 식별자를 기반으로 한 **상대 경로 가변 인자(String... relativePaths)**만 전달하면 됩니다. 서비스 내에서 DTO(`FileUploadInfo`)와 Spring의 `Resource` 객체로 변환하여 반환하므로 계층 간 결합도가 낮아집니다.
+- **부분 인덱스 적용:** Soft Delete(`is_deleted = true`)된 데이터는 일반적인 폴더 트리 탐색 대상에서 제외됩니다. 따라서 `WHERE is_deleted = false` 조건을 단 부분 인덱스를 생성하여, 인덱스 트리의 크기를 줄였습니다.
+
+#### 5-1-3. 성능 검증
+**[테스트 환경 및 데이터 셋업]**
+* **데이터 규모:** 더미 데이터 총 `58만` 건 구축 (`폴더 10만 건, 파일 48만 건`)
+* **테스트 대상:** 폴더 깊이가 `2`인 폴더 중, `23,436`개의 하위 자원을 보유한 폴더
+* **측정 도구:** PostgreSQL `EXPLAIN ANALYZE`
 
 <br>
 
-**사용 방법 (상대 경로 기반 가변 인자 활용)**
-메서드 호출 시 `application.yml`에 정의된 `baseDir`을 기준으로, 하위 폴더들을 콤마로 나열하여 호출합니다.
-
-```java
-// 비즈니스 로직에서는 논리적인 상대 경로만 던짐
-String[] relativePaths = {"driveCode", "fileId"}
-fileStorageService.store(file, fileId, relativePaths);
-Resource res = fileStorageService.loadResourceWithRelativePath(relativePaths);
-fileStorageService.deleteDirectory(relativePaths);
+**[실행 계획 분석 비교]**
+* **대조군 (Recursive CTE):**
+```sql
+EXPLAIN ANALYZE
+WITH RECURSIVE folder_tree AS (
+    SELECT id, parent_folder_id, name, logical_path
+    FROM drive_folder_tb 
+    WHERE id = '59ff3411-809a-4048-9f7e-2a017dde5b0e'
+      AND is_deleted = false
+    
+    UNION ALL
+    
+    SELECT f.id, f.parent_folder_id, f.name, f.logical_path
+    FROM drive_folder_tb f
+    INNER JOIN folder_tree t ON f.parent_folder_id = t.id
+    WHERE f.is_deleted = false
+)
+SELECT * FROM folder_tree;
 ```
 
-<br>
-
-**보안 및 방어 로직**
-- **Path Traversal 방어:** `..` 문자열을 포함하거나 절대 경로(`/, C:\`)를 직접 지정하여 baseDir 밖의 시스템 파일(예: `/etc/passwd`)에 접근하려는 시도를 차단합니다 (`startsWith` 검증).
-- **확장자 화이트리스트:** 허용된 확장자 셋을 통해 시스템에서 허용된 안전한 문서/이미지 파일만 업로드되도록 합니다.
-
-<hr><br>
-
-### 5-3. 장애 대응 및 트러블슈팅
-**1. 특정 사용자가 폴더나 파일에 접근할 때 403 (PERMISSION_DENIED) 에러 발생**
-- **원인 파악**: 공유 가능한 자원의 권한은 `permission_tb에서` 일괄 관리됩니다. 해당 자원(`TargetType`, `TargetId`)에 대해 유저(`SubjectType`, `SubjectId`)의 권한 Row가 존재하는지 1차로 확인합니다.
-
-- **로직 추적 (단건 자원)**: AOP(`@RequirePermission`)를 통해 검증되는 자원이라면, `PermissionService.checkPermission()` 로직을 확인합니다.
-
-- **로직 추적 (다건 자원)**: 폴더 이동/삭제 등 다건 처리 시에는 퍼사드나 서비스 계층 내부에서 호출되는 `drivePermissionService.validateBoundaryAndAccess` 등 명시적 권한 검증 로직이 올바르게 동작하는지 확인합니다.
-
-<br>
-
-**2. DB 쿼리를 통한 임베딩 스케줄러 수동 개입**
-- 특정 파일의 즉시 재처리가 필요한 경우 DB 쿼리를 통해 스케줄러를 제어할 수 있습니다.
 
 ```sql
-UPDATE drive_file_tb 
-SET embedding_status = 'PRIORITIZED', modified_date = NOW() 
-WHERE id IN ('{파일ID_1}', '{파일ID_2}');
+CTE Scan on folder_tree  (cost=2430.20..2440.22 rows=501 width=2064) (actual time=0.044..31.053 rows=3906 loops=1)
+  CTE folder_tree
+    ->  Recursive Union  (cost=0.42..2430.20 rows=501 width=385) (actual time=0.042..29.654 rows=3906 loops=1)
+          ->  Index Scan using drive_folder_tb_pkey on drive_folder_tb  (cost=0.42..8.44 rows=1 width=385) (actual time=0.041..0.042 rows=1 loops=1)
+                Index Cond: ((id)::text = '59ff3411-809a-4048-9f7e-2a017dde5b0e'::text)
+                Filter: (NOT is_deleted)
+          ->  Nested Loop  (cost=4.46..241.68 rows=50 width=385) (actual time=3.345..4.794 rows=651 loops=6)
+                ->  WorkTable Scan on folder_tree t  (cost=0.00..0.20 rows=10 width=516) (actual time=0.000..0.124 rows=651 loops=6)
+                ->  Bitmap Heap Scan on drive_folder_tb f  (cost=4.46..24.10 rows=5 width=385) (actual time=0.005..0.005 rows=1 loops=3906)
+                      Recheck Cond: (((t.id)::text = (parent_folder_id)::text) AND (NOT is_deleted))
+                      Heap Blocks: exact=1027
+                      ->  Bitmap Index Scan on uk_active_subfolder_name  (cost=0.00..4.46 rows=5 width=0) (actual time=0.005..0.005 rows=1 loops=3906)
+                            Index Cond: ((parent_folder_id)::text = (t.id)::text)
+Planning Time: 0.259 ms
+Execution Time: 31.440 ms
 ```
 
-- **폴더의 isAllEmbedded 상태 불일치**: DB에 직접 쿼리를 실행하여 상태를 강제 변경한 경우, 부모 폴더의 `isAllEmbedded` 상태와 불일치할 수 있습니다. 나중에 스케줄러가 임베딩을 완료하여 폴더 임베딩 상태 동기화 로직(`DriveEmbeddingService.updateFolderEmbStatusByFolderId()`)을 호출하면 자연스럽게 동기화됩니다.
-
-### 5-4. 기능 확장 시 구현 유의사항
-- **트랜잭션 파편화 주의**: 폴더 이동, 다중 삭제 등 여러 도메인(`DriveFolderService` + `DriveFileService` + `PermissionService`)이 얽힌 작업은 `DriveCommandFacade` 계층에서 조합하고, 최상위 메서드에 하나의 `@Transactional`로 묶어야 합니다. 단위 서비스 내부에서 `REQUIRES_NEW` 옵션을 쓰거나 `Facade`를 우회하여 컨트롤러와 직접 매핑할 경우, 예외 발생 시 작업의 원자성이 보장되지 않습니다.
-
-- **권한 부여**: 단일 자원 권한 부여 시, `PermissionService.grantPermission()`를, 다수의 권한을 동시에 부여해야 하는 경우에는 `PermissionService.grantPermissionBulk()`를 이용하면 됩니다.
-
-- **신규 권한 도메인 추가 (OCP 준수)**:
-추후 새로운 자원에 공유/권한 시스템을 도입할 때 기존 테이블(`permission_tb`)이나 권한 검증 로직을 수정할 필요가 없습니다.
-  - `TargetType.java`에 신규 도메인 상수 추가
-  - 해당 자원이 상속 구조(계층형)라면 `HierarchyPathResolver` 인터페이스를 구현한 클래스를 생성하고 Spring Bean으로 등록. (런타임에 자동 주입됨)
-  - 상속 구조가 없는 단일 자원이라면, 별도 구현 없이 기본 검증 로직(`hasAnyRequiredRole`)이 동작합니다.
-  - 자원이 생성될 때 해당 자원에 대한 권한을 `permission_tb`에 `INSERT` 해주는 로직은 필요합니다.
-  - 해당 자원에 대한 접근 제어는 Controller API에 `@RequiredPermission` 어노테이션을 붙여 활성화합니다.
-
-### 5-5. 남겨둔 기술 부채
-다른 서버로 배포하거나 향후 시스템을 고도화할 때 해결해야 할 과제들입니다.
-
-**[배포 시 필수 데이터 마이그레이션]**
-1. **기존 자원 소유권(OWNER) 부여:** `drive_tb`(드라이브) 및 `prompt_tb`(프롬프트) 등 기존 시스템에서 생성된 자원들이 정상적으로 조회되려면, 각 자원의 생성자에게 `OWNER` 권한을 `permission_tb`에 일괄 `INSERT` 해야 합니다. (5번 서버는 처리 완료됨)
-
-2. **채팅방(CHAT_ROOM) 권한 데이터 이관 정책 결정**
-   - **전면 이관** : 기존의 모든 채팅방 생성자 권한 정보를 `permission_tb`에 전부 `INSERT` 해주고, 채팅방 생성시에도 항상 `INSERT` 하여 단일 권한망으로 통일합니다.
-
-     - **트레이드오프**
-       - `장점`: 권한 검증 로직이 `permission_tb` 하나로 단일화되어 코드가 깔끔해지고 유지보수하기 좋습니다.
-       - `단점`: 초기 데이터 마이그레이션 비용이 발생하며, `permission_tb`의 테이블 Row 수가 증가할 수 있습니다.
-
-   - **하이브리드** : 공유된 채팅방만 `permission_tb`에 `INSERT`하고, 일반적인 개인 채팅방은 `created_id`로 검증하도록 `PermissionService` 내에 분기 처리를 추가합니다.
-
-      - **트레이드오프**
-        - `장점`: `permission_tb`의 데이터 적재 부담을 줄일 수 있습니다.
-        - `단점`: `PermissionService` 내부에 자원 타입(`CHAT_ROOM`)에 따른 `if/else` 예외 분기 로직 추가가 필요합니다.
+하위 노드를 찾기 위해 임시 테이블을 생성하고, 조인 루프(`loops=3906`)가 반복적으로 발생했습니다. (소요 시간: **31.440 ms**)
 
 <br>
 
-**[시스템 고도화 및 부채 해결]**
-1. **논리 삭제(Soft Delete) 데이터의 물리적 정리 배치:** 현재 드라이브 파일 삭제 시 DB 레벨에서 논리 삭제(`is_deleted = true`)만 수행 중입니다. 스토리지 저장소 절약을 위해, 보존 기한(TTL, 예: 30일)이 지난 자원들을 물리 스토리지에서 완전히 삭제(Hard Delete)하는 스케줄러 배치의 구현이 필요합니다.
+* **실제 적용군 (Path Enumeration):**
+```sql
+EXPLAIN ANALYZE
+SELECT id, parent_folder_id, name, logical_path
+FROM drive_folder_tb 
+WHERE logical_path LIKE '/bef81acd-b8c5-4352-8280-37cdf5536098/7abc839b-4b1c-45eb-9e98-fc9b9075b805/59ff3411-809a-4048-9f7e-2a017dde5b0e/%'
+  AND is_deleted = false;
+```
 
-2. **공유 링크 리다이렉트 URL 반환:** `ShareLinkController`에서 사용자가 공유 링크를 수락하여 권한을 얻었을 때, 프론트엔드가 즉시 해당 폴더/파일 화면으로 이동할 수 있도록 응답 모델(Response)에 타겟 자원의 정확한 리다이렉트 URL을 포함시켜 반환하는 작업이 필요합니다.
+```sql
+Bitmap Heap Scan on drive_folder_tb  (cost=1048.21..6872.69 rows=3946 width=385) (actual time=0.875..2.650 rows=3906 loops=1)
+  Recheck Cond: (NOT is_deleted)
+  Filter: ((logical_path)::text ~~ '/bef81acd-b8c5-4352-8280-37cdf5536098/7abc839b-4b1c-45eb-9e98-fc9b9075b805/59ff3411-809a-4048-9f7e-2a017dde5b0e/%'::text)
+  Heap Blocks: exact=261
+  ->  Bitmap Index Scan on idx_active_logical_path  (cost=0.00..1047.22 rows=3868 width=0) (actual time=0.843..0.843 rows=3906 loops=1)
+        Index Cond: (((logical_path)::text ~>=~ '/bef81acd-b8c5-4352-8280-37cdf5536098/7abc839b-4b1c-45eb-9e98-fc9b9075b805/59ff3411-809a-4048-9f7e-2a017dde5b0e/'::text) AND ((logical_path)::text ~<~ '/bef81acd-b8c5-4352-8280-37cdf5536098/7abc839b-4b1c-45eb-9e98-fc9b9075b805/59ff3411-809a-4048-9f7e-2a017dde5b0e0'::text))
+Planning Time: 0.182 ms
+Execution Time: 2.755 ms
+```
+  * 루프가 발생하지 않고, **Bitmap Index Scan**을 통해 조건에 맞는 인덱스 블록만 추출함을 확인했습니다. (소요 시간: **2.755 ms**)
 
-3. **파일명 확장자 제거:** 현재 `DriveFileEntity`의 파일명에 확장자가 포함되어 있어 파일 이름 변경 시 확장자도 변경될 수 있는 문제점이 존재합니다. 파일 이름을 DB에 저장할 때 확장자를 제외해서 저장하고, 렌더링 방식을 프론트엔드와 조율할 필요가 있습니다.
+<br>
 
-4. **채팅방 조회 API 추가:** 채팅방 공유 기능이 도입됨에 따라, 채팅방 조회 시 `@RequiredPermission`을 통한 접근 제어가 필요합니다. 현재 채팅방 조회 API가 없으므로 만들어야 합니다.
+#### 5-1-4. 검증 결과
 
-5. **레거시 테이블 제거:** 권한 시스템 통합으로 인해 `drive_user_tb`는 더 이상 사용되지 않습니다. 마이그레이션 완료 후 해당 테이블은 제거하면 됩니다. (4번, Clinet 서버 대상)
+```mermaid
+xychart-beta
+    title "계층 구조 탐색 쿼리 실행 시간 (단위: ms)"
+    x-axis ["기존 (Recursive CTE)", "개선 (Path Enumeration)"]
+    y-axis "실행 시간 (ms)" 0 --> 35
+    bar [31.4, 2.7]
+```
 
-6. **드라이브 엔티티 인덱스 재설정** 
-   - 현재 `drive_file_tb`와 `drive_folder_tb`의 DB 인덱스가 이전(JPA ddl-auto) 상태로 남아있습니다.
-   - 각 엔티티 클래스 상단에 명시된 주석을 참고하여, DB에 직접 인덱스 삭제 후 `CREATE INDEX` 구문으로 다시 생성해 주어야 합니다. 
-   - `UNIQUE` 제약조건이 걸린 인덱스는 이미 생성되어 있습니다.
+| 설계 지표 | 일반적 인접 목록 (대조군) | 경로 열거 패턴 (실제 적용군) | 도입 성과 |
+| :--- | :--- | :--- | :--- |
+| **실행 시간 (DB 쿼리)** | 31.440 ms | 2.755 ms | 약 11배 성능 우위 |
+| **DB 스캔 방식** | 여러 번의 Nested Loop Join | 단일 Bitmap Index Scan | CPU 연산 및 I/O 감소 |
 
-7. **조직 기반 그룹(Group) 권한 연동 활성화**
-   - DB 스키마(`subject_type`)와 권한 검증 로직은 그룹 권한을 지원하도록 설계되어 있으나, 현재 `PermissionService` 내에서 유저의 소속 그룹 ID를 주입하는 부분은 임시로 빈 리스트(`new ArrayList<>()`)로 남아있습니다.
-   - 향후 사내 조직 및 그룹 관리 시스템 연동이 완료되면, 유저의 소속 그룹 ID 리스트를 추출하여 주입하도록 수정하면 됩니다. 이를 통해 부서나 팀 단위의 자원 접근 제어 검증이 활성화됩니다.
 
-### 5-6. 핵심 코드 맵핑
-유지보수를 위해 시스템의 맥락을 파악할 수 있는 주요 클래스 위치입니다.
+---
 
-- **흐름 제어 및 트랜잭션 경계 (Facade)**`
-  - service/drive/facade/DriveCommandFacade.java (쓰기/수정/삭제 오케스트레이션)
-  - service/drive/facade/DriveQueryFacade.java (조회 전용)
+<br>
 
-- **임베딩 스케줄러**
-  - service/drive/embedding/DriveEmbeddingScheduler.java
+### 5-2. 대규모 계층 구조의 Soft Delete 성능 최적화: 쿼리 발생 횟수 상수 횟수로 최적화
 
-- **권한 제어 및 다형성 AOP 처리**
-  - common/aop/PermissionAspect.java (권한 검증 진입점)
-  - common/service/PermissionService.java (동적 라우팅 및 롤백 제어)
-  - common/resolver/hierarchy/ (도메인별 권한 계층 해석기 구현체들)
+#### 5-2-1. 문제 상황
+드라이브 서비스에서 상위 폴더를 삭제하면 해당 폴더를 포함하여 하위의 모든 자식 폴더와 파일들의 상태를 `is_deleted = true`로 변경하는 **Soft Delete** 작업이 필요합니다. 기존 로직은 JPA 변경감지에 의존하여 성능 병목을 유발했습니다.
 
-- **계층 경로 최적화 쿼리 (Bulk Update)**
-  - repository/drive/folder/DriveFolderRepositoryImpl.java
-  - repository/drive/file/DriveFileRepositoryImpl.java
+```java
+// 하위 자원을 찾기 위해 엔티티 그래프를 탐색하며 N번의 재귀 호출 발생
+private void deleteFolderRecursively(DriveFolderEntity folder) {
+    folder.delete();
+    for (DriveFileEntity file : folder.getFiles()) file.delete(); 
+    for (DriveFolderEntity sub : folder.getChildFolders()) deleteFolderRecursively(sub);
+}
+```
 
+
+* **$O(N)$ 쿼리 발생:** 하위 자원에 비례하여 선형적으로 쿼리가 증가합니다. 하위 폴더가 약 2만 개일 경우, 약 2만 번에 달하는 쿼리가 발생합니다.
+* **DB 커넥션 점유 및 OOM 위험:** 단일 요청이 DB 트랜잭션을 오랫동안 점유하면서, 동시 접속자가 늘어나면 HikariCP 커넥션 풀 고갈 위험이 있었습니다. 또한 수만 개의 엔티티를 영속성 컨텍스트에 올리게 되어 OOM 위험이 있었습니다.
+
+#### 5-2-2. 해결 방안
+JPA의 변경감지 대신, **QueryDSL을 활용한 Bulk Update**로 수정했습니다.
+
+```sql
+-- 애플리케이션 메모리에 올리지 않고, 경로 열거 패턴을 활용하여 DB 레벨에서 일괄 처리
+UPDATE drive_folder_tb SET is_deleted = true WHERE logical_path LIKE '/root-id/%';
+UPDATE drive_file_tb f SET is_deleted = true FROM drive_folder_tb d 
+WHERE f.folder_id = d.id AND d.logical_path LIKE '/root-id/%';
+```
+
+* **Path-based 필터링:** 각 자원이 가진 `logical_path` 컬럼을 활용했습니다. 삭제 대상 폴더의 경로가 `/A/B/`라면, 하위 모든 자식은 `/A/B/%` 형태의 경로를 가집니다.
+* **단일 SQL 처리:** JPA 엔티티를 하나씩 메모리에 올리는 대신, QueryDSL의 Bulk Update를 사용하여 DB 엔진 단에서 단 한 번의 쿼리로 모든 하위 자원을 처리하도록 변경했습니다.
+
+
+#### 5-2-3. 검증 결과
+데이터 규모를 4단계로 나누어 테스트하였습니다.
+* **측정 도구:** JUnit 5, Spring StopWatch, Hibernate Statistics
+
+| 삭제 대상 하위 폴더 규모 | 기존 방식 (JPA 재귀) 처리 시간 | 개선 방식 (Bulk) 처리 시간 | 기존 방식 발생 쿼리 | 개선 방식 발생 쿼리 |
+| :--- | :--- | :--- | :--- | :--- |
+| **156개** | 0.41 초 | **0.11 초** | 167 회 | **5 회** |
+| **781개** | 0.86 초 | **0.17 초** | 806 회 | **5 회** |
+| **3,906개** | 2.24 초 | **0.19 초** | 3,995 회 | **5 회** |
+| **19,531개**| 7.88 초 | **0.70 초** | 19,934 회 | **5 회** |
+
+<br>
+
+**[최적화 성과 요약]**
+- **DB 통신 비용(Network RTT) 최적화:** 데이터가 2만 건으로 증가해도 발생하는 DB 쿼리를 상수 횟수인 5회로 고정시켜, 애플리케이션과 DB 간의 통신 횟수를 99.97% 감소 시켰습니다.
+- **DB 커넥션 점유 시간 최적화:** 수만 번의 조회 쿼리로 인해 7.8초 가량 묶여있던 DB 커넥션 점유 시간을 0.7초로 91.1% 단축시켰습니다.
+- **메모리(영속성 컨텍스트) 최적화:** 2만 개의 대상 엔티티를 메모리에 로드하는 비용을 제거하여 대규모 상태 갱신 작업 시의 OOM 위험을 예방했습니다.
+
+---
+
+
+### 5-3. 대규모 계층 구조 이동 성능 최적화: 쿼리 발생 횟수 상수 횟수로 최적화**
+
+#### 5-3-1. 문제 상황
+드라이브 시스템에서 경로 열거 패턴을 사용하면 조회 성능은 상승하지만, **특정 폴더를 다른 위치로 이동할 때 하위 모든 자손들의 `logical_path`와 `depth`를 전부 수정해야 하는 쓰기 비용**이 발생합니다.
+
+```java
+// 하위 폴더를 모두 조회하여 메모리(영속성 컨텍스트)에 올린 뒤 하나씩 경로 수정
+List<DriveFolderEntity> descendants = driveFolderQueryRepository.findDescendantFoldersByPath(originalPath);
+for (DriveFolderEntity child : descendants) {
+    String newPath = child.getLogicalPath().replaceFirst(originalPath, newPath);
+    child.updatePathInfo(newPath, newDepth); // 더티 체킹으로 인한 개별 UPDATE 발생
+}
+```
+* **메모리 및 연산 오버헤드:** 기존 로직은 JPA의 변경 감지를 활용했습니다. 이동할 폴더의 하위 자원 3,900여 개를 모두 영속성 컨텍스트(메모리)에 올려 객체의 상태를 하나씩 변경했습니다.
+* **$O(N)$ 쿼리:** 하위 자원의 개수에 정비례하여  `UPDATE` 쿼리가 발생합니다. 하위 폴더가 약 2만 개일 경우, 19,500여 번에 달하는 쿼리가 발생합니다.
+
+#### 5-3-2. 해결 방안
+JPA의 변경감지 대신, **DB 내장 함수(`REPLACE`)와 QueryDSL을 활용한 Bulk Update**로 수정했습니다.
+
+```sql
+-- 애플리케이션 메모리 로딩을 배제하고, DB 레벨에서 경로 문자열 치환 연산 일괄 수행
+UPDATE drive_folder_tb 
+SET logical_path = REPLACE(logical_path, '/old-path/', '/new-path/'),
+    depth = depth + :depthDifference
+WHERE logical_path LIKE '/old-path/%';
+```
+
+* **DB 내장 함수 활용:** 애플리케이션 단에서 문자열을 조작하지 않고, SQL의 `REPLACE` 함수를 활용하는 Bulk 쿼리를 작성하여 하위 폴더들의 `logical_path`와 `depth`를 한 번의 쿼리로 일괄 갱신했습니다.
+
+
+#### 5-3-3. 검증 결과
+데이터 규모를 4단계로 나누어 테스트하였습니다.
+* **측정 도구:** JUnit 5 + Spring StopWatch, Hibernate Statistics
+
+| 이동 대상 하위 폴더 규모 | 기존 방식 (JPA 재귀) 처리 시간 | 개선 방식 (Bulk) 처리 시간 | 기존 방식 발생 쿼리 | 개선 방식 발생 쿼리 |
+| :--- | :--- | :--- | :--- | :--- |
+| **157개** | 0.41 초 | **0.12 초** | 159 회 | **7 회** |
+| **782개** | 0.93 초 | **0.22 초** | 784 회 | **7 회** |
+| **3,907개** | 2.16 초 | **0.30 초** | 3,909 회 | **7 회** |
+| **19,532개**| 5.63 초 | **1.20 초** | 19,534 회 | **7 회** |
+
+<br>
+
+**[최적화 성과 요약]**
+- **DB 통신 비용(Network RTT) 최적화:** 데이터가 2만 건으로 증가해도 발생하는 DB 쿼리를 상수 횟수인 7회로 고정시켜, 애플리케이션과 DB 간의 통신 횟수를 99.96% 절감했습니다.
+- **DB 커넥션 점유 시간 최적화:** 수만 번의 단건 쿼리와 애플리케이션 문자열 연산으로 인해 5.6초 가량 묶여있던 DB 커넥션 점유 시간을 1.2초로 78.6% 단축시켰습니다.
+- **메모리(영속성 컨텍스트) 최적화:** 2만 개의 대상 엔티티를 메모리에 로드하는 비용을 제거하여 대용량 트리 이동 시의 OOM 위험을 예방했습니다.
+
+---
+
+<br>
+
+### 5-4. 폴더 임베딩 상태 동기화 성능 최적화: 쿼리 39회 → 4-5회
+
+#### 5-4-1. 문제 상황: 상향식 전파의 구조적 한계
+파일 임베딩 완료 시, 해당 파일이 속한 폴더부터 최상위 루트까지 모든 조상 폴더들의 **임베딩 완료 여부**를 실시간으로 갱신해야 합니다.
+
+* **기존 방식 (재귀적 동기화):**
+```java
+List<String> folderIds = new ArrayList<>();
+String[] pathParts = logicalPath.split("/");
+
+// 파싱 및 역순 정렬 (자식 -> 부모 -> 조상)
+for (int i = pathParts.length - 1; i >= 0; i--) {
+    if (!pathParts[i].isEmpty()) {
+        folderIds.add(pathParts[i]);
+    }
+}
+
+// 상태 업데이트
+for (String folderId : folderIds) {
+    boolean hasIncompleteFile = driveFileQueryRepository.existsNotCompletedFileInFolder(folderId);
+
+    boolean hasIncompleteSubFolder = driveFolderQueryRepository.existsNotCompletedSubFolder(folderId);
+
+    boolean isComplete = !hasIncompleteFile && !hasIncompleteSubFolder;
+
+    driveFolderQueryRepository.updateAllEmbeddedStatus(folderId, isComplete);
+}
+```
+  * 자식 폴더에서 부모 폴더 ID를 참조하여 한 단계씩 거슬러 올라가는 방식.
+  * 조상 노드 하나를 검증할 때마다 `[미완료 파일 체크(SELECT) → 미완료 자식 폴더 체크(SELECT) → 상태 갱신(UPDATE)]`의 3단계 과정이 반복됩니다.
+  * 결과: 트리의 깊이가 $D$일 때, $O(D \times 3)$ 회의 쿼리가 발생합니다. 테스트 환경(Depth 12)에서는 단 한 번의 상태 변화를 위해 약 39회의 DB I/O가 발생하여 가용성이 저하되었습니다.
+
+#### 5-4-2. 해결 방안: 메모리 연산 & Bulk Update
+매 단계 DB를 조회하는 대신, 임베딩 상태값 변화 영향권에 있는 모든 조상 폴더를 메모리에 로드하여 연산한 뒤 결과를 일괄 반영하도록 구조를 변경했습니다.
+
+```java
+List<DriveFolderEntity> folders = driveFolderQueryRepository.findByIds(new ArrayList<>(folderIds));
+Set<String> allTargetFolderIds = folders.stream()
+        .flatMap(f -> f.getAncestorFolderIds().stream())
+        .collect(Collectors.toSet());
+
+if (allTargetFolderIds.isEmpty()) return;
+
+// 미완료 파일을 가진 폴더 아이디들 (변하지 않는 상태)
+Set<String> folderIdsWithIncompleteFiles = driveFileQueryRepository.findFolderIdsWithIncompleteFiles(allTargetFolderIds);
+
+// 각 폴더별 임베딩 미완료 자식 폴더의 개수 (자식 폴더 상태가 바뀌면 바뀔 수 있음)
+Map<String, Long> incompleteChildCounts = driveFolderQueryRepository.findIncompleteSubFolderCounts(allTargetFolderIds);
+
+// 논리 경로에 있던 폴더 조회 및 정렬 (자식 -> 부모 순)
+List<DriveFolderEntity> sortedFolders = driveFolderQueryRepository.findByIds(new ArrayList<>(allTargetFolderIds));
+sortedFolders.sort((f1, f2) -> Integer.compare(f2.getDepth(), f1.getDepth()));
+
+// 폴더 임베딩 상태 bulk 연산 시킬 폴더 ID 목록
+List<String> folderIdsToMarkComplete = new ArrayList<>();
+List<String> folderIdsToMarkIncomplete = new ArrayList<>();
+
+// 자식 -> 부모 -> 조상 순서대로 폴더 임베딩 완료 상태 업데이트 및 업데이트할 폴더 아이디 수집
+evaluateStatusAndCollectUpdates(sortedFolders, folderIdsWithIncompleteFiles, incompleteChildCounts, folderIdsToMarkComplete, folderIdsToMarkIncomplete);
+
+// bulk로 일괄 업데이트
+if (!folderIdsToMarkComplete.isEmpty()) {
+    driveFolderRepository.bulkUpdateAllEmbeddedStatus(folderIdsToMarkComplete, true);
+}
+if (!folderIdsToMarkIncomplete.isEmpty()) {
+    driveFolderRepository.bulkUpdateAllEmbeddedStatus(folderIdsToMarkIncomplete, false);
+}
+```
+
+   * **조상 폴더 일괄 로딩:** `logical_path`를 파싱하여 루트까지의 조상 ID 리스트를 추출하고, 1회의 `IN` 절 쿼리로 상태 판단에 필요한 조상 엔티티와 미완료 카운트를 로드합니다.
+   * **메모리 기반 상향식 전파:** 로드된 폴더들을 Depth 역순(`자식 → 부모`)으로 정렬하여 메모리 내에서 상태를 평가합니다. 자식 폴더의 상태가 결정되면 부모 폴더의 미완료 카운트를 갱신하여 DB 조회 없이 연쇄적인 상태 판별을 수행합니다.
+   * **최종 상태 Bulk Update:** 연산 결과, 실제로 상태 변경(`True` 또는 `False`)이 필요한 폴더 ID만 필터링하여 최대 2회의 Bulk Update 쿼리로 모든 조상의 상태를 한 번에 갱신합니다.
+
+
+#### 5-4-3. 검증 결과
+
+```mermaid
+xychart-beta
+    title "상태 동기화 시 DB 쿼리 발생 횟수"
+    x-axis ["기존 (재귀적 조회)", "개선 (In-Memory 연산 후 일괄 갱신)"]
+    y-axis "쿼리 횟수" 0 --> 45
+    bar [39, 4]
+```
+
+* **테스트 환경:** 총 폴더 `8,191`개, 파일 `16,380`개, 최대 깊이 12의 트리 구조
+* **테스트 시나리오:** 최하단(`Depth 12`) 파일의 상태 변경이 루트(`Depth 0`)까지 12단계에 걸쳐 전파될 때의 부하 측정
+* **측정 도구:** JUnit 5, Spring StopWatch, Hibernate Statistics
+
+| 성능 지표 | 기존 방식 (Recursive Sync) | 개선 방식 (In-Memory Sync) | 개선 성과 |
+| :--- | :--- | :--- | :--- |
+| **쿼리 발생 횟수** | 39회 | **4-5회** | **87.1% 절감** |
+| **처리 시간 (로컬 환경)** | 0.212 sec | **0.101 sec** | **52.3% 단축** |
 
 <br>
 
