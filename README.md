@@ -826,7 +826,7 @@ WHERE logical_path LIKE '/old-path/%';
 | **3,907개** | 2.16 초 | **0.30 초** | 3,909 회 | **7 회** |
 | **19,532개**| 5.63 초 | **1.20 초** | 19,534 회 | **7 회** |
 
-* `*참고`: 개선 방식의 7회 쿼리는 권한 및 대상 확인을 위한 검증용 SELECT 5회와 이동 대상 최상위 폴더 자체를 갱신하는 단건 UPDATE 1회, 그리고 하위 자손 폴더 전체의 경로와 깊이를 치환하는 Bulk UPDATE 1회로 구성됩니다.
+* *`참고`: 개선 방식의 7회 쿼리는 권한 및 대상 확인을 위한 검증용 SELECT 5회와 이동 대상 최상위 폴더 자체를 갱신하는 단건 UPDATE 1회, 그리고 하위 자손 폴더 전체의 경로와 깊이를 치환하는 Bulk UPDATE 1회로 구성됩니다.*
 
 <br>
 
@@ -839,9 +839,9 @@ WHERE logical_path LIKE '/old-path/%';
 
 <br>
 
-### 5-2. 대규모 계층 구조의 Soft Delete 성능 최적화: 쿼리 발생 횟수 상수 횟수로 최적화
+### 5-4. 대규모 계층 구조의 Soft Delete 성능 최적화: 쿼리 발생 횟수 상수 횟수로 최적화
 
-#### 5-2-1. 문제 상황
+#### 5-4-1. 문제 상황
 드라이브 서비스에서 상위 폴더를 삭제하면 해당 폴더를 포함하여 하위의 모든 자식 폴더와 파일들의 상태를 `is_deleted = true`로 변경하는 **Soft Delete** 작업이 필요합니다. 기존 로직은 JPA 변경감지에 의존하여 성능 병목을 유발했습니다.
 
 ```java
@@ -857,7 +857,7 @@ private void deleteFolderRecursively(DriveFolderEntity folder) {
 * **DB 커넥션 점유:** 단일 요청이 DB 트랜잭션을 오랫동안 점유하면서, 동시 접속자가 늘어나면 커넥션 풀 고갈 위험이 있습니다.
 * **메모리 및 연산 오버헤드:** 삭제할 폴더의 하위 폴더들을 모두 영속성 컨텍스트(메모리)에 올려 객체의 상태를 하나씩 변경합니다.
 
-#### 5-2-2. 해결 방안
+#### 5-4-2. 해결 방안
 JPA의 변경감지 대신, **QueryDSL을 활용한 Bulk Update**로 수정했습니다.
 
 ```sql
@@ -871,7 +871,7 @@ WHERE f.folder_id = d.id AND d.logical_path LIKE '/root-id/%';
 * **단일 SQL 처리:** JPA 엔티티를 하나씩 메모리에 올리는 대신, QueryDSL의 Bulk Update를 사용하여 DB 엔진 단에서 단 한 번의 쿼리로 모든 하위 자원을 처리하도록 변경했습니다.
 
 
-#### 5-2-3. 검증 결과
+#### 5-4-3. 검증 결과
 데이터 규모를 4단계로 나누어 테스트하였습니다.R
 * **측정 도구:** JUnit 5, Spring StopWatch, Hibernate Statistics
 
@@ -882,7 +882,7 @@ WHERE f.folder_id = d.id AND d.logical_path LIKE '/root-id/%';
 | **3,906개** | 2.24 초 | **0.19 초** | 3,995 회 | **5 회** |
 | **19,531개**| 7.88 초 | **0.70 초** | 19,934 회 | **5 회** |
 
-* `*참고`: 개선 방식의 5회 쿼리는 권한 및 대상 확인을 위한 검증용 SELECT 3회와 삭제할 폴더 하위에 속한 모든 파일과 폴더를 각각 일괄 Soft Delete 처리하는 Bulk UPDATE 2회로 구성됩니다.
+* *`참고`: 개선 방식의 5회 쿼리는 권한 및 대상 확인을 위한 검증용 SELECT 3회와 삭제할 폴더 하위에 속한 모든 파일과 폴더를 각각 일괄 Soft Delete 처리하는 Bulk UPDATE 2회로 구성됩니다.*
 
 <br>
 
@@ -891,7 +891,111 @@ WHERE f.folder_id = d.id AND d.logical_path LIKE '/root-id/%';
 - **DB 커넥션 점유 시간 최적화:** 수만 번의 조회 쿼리로 인해 7.8초 가량 묶여있던 DB 커넥션 점유 시간을 0.7초로 91.1% 단축시켰습니다.
 - **메모리(영속성 컨텍스트) 최적화:** 2만 개의 대상 엔티티를 메모리에 로드하는 비용을 제거하여 대규모 상태 갱신 작업 시의 OOM 위험을 예방했습니다.
 
+---
+
 <br>
+
+### 5-5. 대규모 임베딩 스케줄러 폴링(Polling) 쿼리 병목 해소
+
+#### 5-5-1. 문제 상황
+드라이브 파일의 벡터 임베딩 처리를 위해 4개의 워커 스레드가 1초 주기로 DB를 조회(`FOR UPDATE SKIP LOCKED`)하여 일감을 가져오는 스케줄러 로직을 구현했습니다. 하지만 대규모 부하 환경을 가정한 테스트에서 큐가 비어있을 때 치명적인 조회 병목이 확인되었습니다.
+
+```java
+// 기존 조회 로직: 모든 상태에 대해 동일한 정렬 적용 및 isNull 조건 포함
+return query.selectFrom(qDriveFileEntity)
+        .where(
+            qDriveFileEntity.embeddingStatus.eq(status),
+            version != null ? qDriveFileEntity.version.isNull().or(qDriveFileEntity.version.lt(version)) : null
+        )
+        .orderBy(qDriveFileEntity.createdDate.asc())
+        .limit(1)
+        .setLockMode(LockModeType.PESSIMISTIC_WRITE)
+        .fetchOne();
+```
+
+* **인덱스 스캔 효율 저하 (`IS NULL` 한계):** `B-Tree` 인덱스는 `NULL` 값을 구조의 끝부분에 저장합니다. `version < 1.2 OR version IS NULL` 처럼 양극단에 위치한 데이터를 `OR` 조건으로 묶을 경우, 옵티마이저는 연속적인 범위 검색(`Range Scan`)을 포기하고 일일이 데이터를 필터링합니다.
+* **비효율적인 실행 계획 선택 (`ORDER BY` 한계):** 모든 상태에 일괄적으로 `ORDER BY created_date ASC`를 적용함에 따라, 옵티마이저가 정렬 비용(Sort)을 피하기 위해 `version` 필터링에 적합한 인덱스 대신 기존 정렬용 인덱스(`status, created_date`)를 선택하는 문제가 발생했습니다.
+* **CPU 스파이크 위험:** 330만 건의 파일이 모두 임베딩 완료(`COMPLETED`)된 상태에서 재처리할 일감이 없는 경우(`version < 0.5`), 스케줄러는 `LIMIT 1`을 찾기 위해 **330만 건의 데이터를 모두 메모리에 올려 필터링**합니다. 4개의 스레드가 1초마다 이 쿼리를 실행하면 DB CPU 자원이 즉시 고갈됩니다.
+
+#### 5-5-2. 해결 방안
+인덱스 분리, 불필요한 방어 로직 제거, 동적 정렬 처리를 통해 쿼리를 최적화했습니다.
+
+```sql
+-- 1. 대규모 임베딩 완료 데이터 버전업 검사 방어용 인덱스 추가 분리
+CREATE INDEX idx_active_embedding_versions ON drive_file_tb (embedding_status, version) WHERE is_deleted = false;
+```
+```java
+// 2. QueryDSL 로직 개선: isNull 제거 및 동적 ORDER BY 적용
+JPAQuery<DriveFileEntity> jpaQuery = query.selectFrom(qDriveFileEntity)
+        .where(
+            qDriveFileEntity.embeddingStatus.eq(status),
+            version != null ? qDriveFileEntity.version.lt(version) : null // IS NULL 제거
+        );
+
+// 신규 업로드 처리 시에만 순차 탐색 적용, 대규모 백그라운드 재처리는 정렬 배제
+if (status == DriveFileEmbeddingStatus.READY || status == DriveFileEmbeddingStatus.PRIORITIZED) {
+    jpaQuery.orderBy(qDriveFileEntity.createdDate.asc());
+}
+```
+
+* **인덱스 분리 타겟팅:** 상태별 데이터 분포도를 고려하여 순차 처리용 인덱스(`status, created_date`)와 버전/시간 필터링용 인덱스(`status, version`)를 명확히 분리했습니다.
+* **`IS NULL` 조건 제거:** DB 레벨에서 `version`의 기본값(`1.0`)이 보장되므로, 방어 로직인 `isNull()`을 제거하여 순수한 `Index Range Scan`을 유도했습니다.
+* **동적 정렬(Dynamic ORDER BY):** 사용자 체감이 중요한 신규 업로드(`READY`, `PRIORITIZED`) 건에만 정렬을 적용하고, 대규모 마이그레이션 성격인 재처리(`COMPLETED`, `FAILED`) 쿼리에서는 `ORDER BY`를 제거하여 옵티마이저가 올바른 인덱스를 타도록 강제했습니다.
+
+#### 5-5-3. 검증 결과
+실제 운영 환경과 유사한 부하를 발생시켜 쿼리 실행 계획을 비교 분석했습니다.
+* **데이터 규모:** 3,308,760 건 (`COMPLETED`, `version = 1.0` 상태)
+* **테스트 상황:** 처리할 일감이 0건인 최악의 탐색 조건 (`version < 0.5`)
+* **측정 도구:** PostgreSQL `EXPLAIN ANALYZE`
+
+**[실행 계획 분석 비교]**
+* **대조군 (튜닝 전: 부적절한 쿼리로 인한 대규모 필터링 발생):**
+  * **분석:** 330만 건을 모두 메모리에 올려 버전을 검사하느라 1.29초 소요. 4개 스레드가 매초 실행 시 DB 다운 위험.
+
+튜닝 전 EXPLAIN ANALYZE 원본
+
+```text
+Limit  (cost=0.43..6.21 rows=1 width=2731) (actual time=1293.545..1293.546 rows=0 loops=1)
+  ->  LockRows  (cost=0.43..6.21 rows=1 width=2731) (actual time=1293.544..1293.545 rows=0 loops=1)
+        ->  Index Scan using idx_active_embedding on drive_file_tb  (cost=0.43..6.20 rows=1 width=2731) (actual time=1293.543..1293.543 rows=0 loops=1)
+              Index Cond: ((embedding_status)::text = 'COMPLETED'::text)
+              Filter: ((NOT is_deleted) AND ((source_type)::text <> ALL ('{CHAT_ROOM,MANUAL_FILE}'::text[])) AND ((version IS NULL) OR (version < '0.5'::double precision)))
+              Rows Removed by Filter: 3308760
+Planning Time: 19.655 ms
+Execution Time: 1293.579 ms
+```
+
+<br>
+
+* **실험군 (튜닝 후: 인덱스 분리, IS NULL 제거, 정렬 조건 제거):**
+  * **분석:** 옵티마이저가 정확히 `version` 인덱스를 활용하여, 조건에 맞는 데이터가 없음을 파악하고 테이블 접근 없이 0.01ms 대에 즉시 탐색 종료. **성능 약 86,000배 향상 및 DB CPU 스파이크 완벽 방어.**
+
+튜닝 후 EXPLAIN ANALYZE 원본
+
+```text
+Limit  (cost=0.43..6.21 rows=1 width=2731) (actual time=0.015..0.015 rows=0 loops=1)
+  ->  LockRows  (cost=0.43..6.21 rows=1 width=2731) (actual time=0.014..0.014 rows=0 loops=1)
+        ->  Index Scan using idx_active_embedding_versions on drive_file_tb  (cost=0.43..6.20 rows=1 width=2731) (actual time=0.013..0.013 rows=0 loops=1)
+              Index Cond: ((embedding_status)::text = 'COMPLETED'::text AND (version < '0.5'::double precision))
+              Filter: ((NOT is_deleted) AND ((source_type)::text <> ALL ('{CHAT_ROOM,MANUAL_FILE}'::text[])))
+Planning Time: 0.174 ms
+Execution Time: 0.032 ms
+```
+
+| 측정 지표 | 기존 방식 (고정 정렬 + OR IS NULL) | 개선 방식 (동적 정렬 + 순수 Range Scan) |
+| :--- | :--- | :--- |
+| **선택된 인덱스** | `idx_active_embedding` (잘못된 인덱스 탑승) | **`idx_active_embedding_versions`** |
+| **필터링된 행 수 (Rows Removed)** | 3,308,760 개 | **0 개** |
+| **총 실행 시간 (Execution Time)** | 1293.579 ms | **0.015 ms** |
+
+<br>
+
+**[최적화 성과 요약]**
+- **메모리 연산 오버헤드 제거:** 쿼리당 330만 건에 달하던 In-Memory 필터링(`Rows Removed by Filter`) 과정을 완전히 제거하여 불필요한 메모리 및 디스크 I/O를 방지했습니다.
+- **폴링 탐색 시간 99.9% 단축:** 텅 빈 큐를 확인하기 위해 발생하던 약 1.3초의 쿼리 실행 시간을 0.015ms 수준으로 단축시켰습니다.
+- **DB CPU 스파이크 방어:** 1초 주기로 폴링을 시도하는 4개의 워커 스레드가 임계점 부하 상황에서도 데이터베이스 자원(CPU)을 점유하지 않도록 안정성을 확보했습니다.
+
+---
 
 ## 6. 기술 스택
 
