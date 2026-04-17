@@ -229,7 +229,9 @@ sequenceDiagram
     %% 3. 재처리 대상 폴더 상태 선제 업데이트
     opt originalStatus == COMPLETED
         E->>SVC: applyFolderEmbeddingStatusByFileId()
+        activate SVC
         SVC->>DB: 폴더 임베딩 상태 연산 및 업데이트 (Tx)
+        deactivate SVC
     end
 
     %% 4. RAG API 연동 (네트워크 I/O)
