@@ -957,6 +957,6 @@ Execution Time: 0.032 ms
 
 | Category | Skills |
 | :--- | :--- |
-| **Backend** | <img src="https://img.shields.io/badge/Java_17-007396?style=for-the-badge&logo=java&logoColor=white"> <img src="https://img.shields.io/badge/Spring_Boot_2.7.5-6DB33F?style=for-the-badge&logo=springboot&logoColor=white"> <br> *(Multi-Module Architecture)* |
+| **Backend** | <img src="https://img.shields.io/badge/Java_21-007396?style=for-the-badge&logo=java&logoColor=white"> <img src="https://img.shields.io/badge/Spring_Boot_3.5.13-6DB33F?style=for-the-badge&logo=springboot&logoColor=white"> |
 | **DB & ORM** | <img src="https://img.shields.io/badge/PostgreSQL-4169E1?style=for-the-badge&logo=postgresql&logoColor=white"> <img src="https://img.shields.io/badge/Spring_Data_JPA-6DB33F?style=for-the-badge&logo=spring&logoColor=white"> <img src="https://img.shields.io/badge/QueryDSL_5.0-0769AD?style=for-the-badge&logo=java&logoColor=white"> |
 | **Security** | <img src="https://img.shields.io/badge/Spring_Security-6DB33F?style=for-the-badge&logo=springsecurity&logoColor=white"> <img src="https://img.shields.io/badge/JWT-000000?style=for-the-badge&logo=jsonwebtokens&logoColor=white"> |
