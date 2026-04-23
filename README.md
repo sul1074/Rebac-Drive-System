@@ -223,6 +223,85 @@ sequenceDiagram
     end
 ```
 
+- **Worker Pool 기반 병렬 처리 및 부하 제어**
+  - 외부 AI 모델(RAG 서버)의 과부하를 막기 위해, `FixedThreadPool`과 `AtomicInteger`를 통해 동시에 실행되는 API 요청 수를 `maxWorkers` 개수로 제한합니다.
+  - 메인 클라이언트 요청을 처리하는 Tomcat 스레드와 임베딩 워커 스레드를 분리하여, 임베딩 지연이 일반 사용자의 API 호출 응답성에 영향을 주지 않도록 합니다.
+
+- **SKIP LOCKED를 활용한 분산 동시성 제어 및 락 최적화** 
+  - 다중 서버 및 다중 스레드 환경에서 동일한 파일에 중복 접근하는 것을 막기 위해 `SELECT FOR UPDATE SKIP LOCKED` 구문을 사용합니다. 경합이 발생해도 스레드가 대기하지 않고 다른 타겟을 찾습니다.
+  - 타겟을 찾으면(선점하면) 상태를 `PROCESSING`으로 변경하고 트랜잭션을 커밋하여 DB 락을 해제합니다.
+  - 이를 통해 DB 커넥션을 점유하는 시간을 최소화하며, 타 워커 스레드가 동일한 타겟에 접근하는 것을 막습니다.
+  - 이후에 이루어지는 벡터 임베딩 API 요청은 DB 락과 트랜잭션이 해제된 상태에서 동기 작업으로 수행됩니다.
+
+- **우선순위 기반 DB 폴링:** DB에서 6단계 우선순위에 따라 1건씩 타겟을 가져옵니다.
+  1. **수동 요청 (PRIORITIZED):** 사용자가 명시적으로 최우선 처리를 요청한 파일
+  2. **실패한 구버전 재처리 (FAILED 중 구버전):** 이전 모델에서 실패했던 파일의 우선 재시도
+  3. **신규 업로드 파일 (READY):** 유저가 새로 업로드한 파일
+  4. **완료된 구버전 마이그레이션 (COMPLETED 중 구버전):** 이미 서비스 중이나 새 버전 모델로 업데이트가 필요한 파일. **신규 파일(`READY`)의 처리를 지연시키지 않기 위해 우선순위를 후순위로 배치**했습니다.
+  5. **좀비 태스크 복구 (PROCESSING - 30분 지연):** 인스턴스 다운 등의 이유로 `PROCESSING` 상태에서 멈춰서 방치된 태스크를 회수하여 재처리합니다.
+  6. **일반 실패 재시도 (FAILED - 60분 경과):** OCR 모델의 처리 오류로 실패한 파일들의 주기적 재시도
+
+- **물리적 존재 여부 검증:** 작업 할당 전 파일 스토리지(`fileStorageService`) 시스템 내 실제 존재 여부를 검증하여, 유실된 파일에 대해 무한 재시도를 하는 낭비를 막고 `MISSING` 상태로 격리합니다.
+
+### 2-2. 폴더 임베딩 상태의 상향식 동기화
+
+**[폴더 임베딩 상태 동기화 흐름]**
+
+```mermaid
+flowchart TD
+    %% 스타일 정의
+    classDef startEnd fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+    classDef db fill:#fce4ec,stroke:#c2185b,stroke-width:2px;
+    classDef process fill:#e3f2fd,stroke:#1565c0,stroke-width:2px;
+    classDef memory fill:#fff3e0,stroke:#f57c00,stroke-width:2px;
+    classDef cond fill:#fff9c4,stroke:#fbc02d,stroke-width:2px;
+
+    Start(["▶ 임베딩 상태 동기화 요청<br>(대상: 파일이 속한 폴더들)"]):::startEnd
+
+    subgraph Step1 ["1. 필요 데이터 일괄 조회 (N+1 방지)"]
+        direction TB
+        FetchAncestors[("타겟 폴더 및 모든 조상 폴더 ID 수집")]:::db
+        FetchFiles[("미완료 파일이 포함된 폴더 ID Set 조회")]:::db
+        FetchChildren[("폴더별 미완료 자식 폴더 개수 Map 조회")]:::db
+        
+        FetchAncestors --> FetchFiles & FetchChildren
+    end
+
+    Start --> Step1
+
+    Step2["2. Depth 역순 정렬<br>(Bottom-Up: 가장 깊은 자식 폴더부터 위로)"]:::process
+    Step1 --> Step2
+
+    subgraph Step3 ["3. 상태 평가 및 상향식 전파"]
+        direction TB
+        Loop{"정렬된 폴더 목록<br>순회 (For-each)"}:::cond
+        
+        CheckStatus["현재 폴더 상태 판별<br>(미완료 파일 없음 && 미완료 자식 폴더 0개)"]:::memory
+        
+        IsChanged{"기존 DB 상태와<br>변경점이 있는가?"}:::cond
+        
+        Collect["일괄 업데이트 목록(List)에<br>폴더 ID 추가 (Complete / Incomplete)"]:::memory
+        
+        Propagate["부모 폴더의 상태 Map 갱신<br>(자식이 완료됨 -> 부모의 미완료 카운트 -1)<br>(자식이 미완료됨 -> 부모의 미완료 카운트 +1)"]:::memory
+        
+        Loop -->|폴더 1건 꺼냄| CheckStatus
+        CheckStatus --> IsChanged
+        IsChanged -->|Yes| Collect
+        Collect --> Propagate
+        Propagate -->|다음 폴더로| Loop
+        IsChanged -->|No 상태 유지| Loop
+    end
+
+    Step2 --> Step3
+
+    subgraph Step4 ["4. 최종 DB 반영"]
+        BulkUpdate[("수집된 ID 대상 Bulk Update<br>(완료된 폴더 일괄 True, 미완료 일괄 False)")]:::db
+    end
+
+    Step3 -->|모든 폴더 순회 완료| Step4
+    Step4 --> End(["최종 완료"]):::startEnd
+```
+
 - **상태 전파의 복잡성:** 특정 하위 파일의 임베딩이 완료/실패 상태로 변경되면, 그 상태가 최상위 조상 폴더의 `isAllEmbedded` 상태까지 전파되어야 합니다 (`자식 -> 부모 -> 조상`).
 
 - **상태 취합 및 일괄 업데이트:** 재귀적인 DB 쿼리 호출을 방지하기 위해, `updateFolderEmbStatusByFolderId` 내에서 타겟 폴더들의 트리 정보를 메모리에 올립니다. 이후 각 폴더의 미완료 자식 카운트(`incompleteChildCounts`)를 메모리상에서 계산하여 **Bottom-Up 방식으로 각 부모 폴더들의 최종 상태를 취합한 뒤, Bulk Update로 DB에 반영**합니다.
